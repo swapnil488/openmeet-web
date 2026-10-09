@@ -24,6 +24,11 @@ To update it later, drag the new folder onto your site's **Deploys** page.
 - The badge on a shared screen shows the real resolution and fps. On the presenter's side
   it also says if the computer or network is holding it back.
 - **Full screen**: tap the corner button on any tile, or double-tap the tile.
+- **Who's talking**: the speaker's tile glows green with a small level badge, like Google Meet.
+- **Audio & video settings** (sliders button, in the lobby and during a call): pick the microphone,
+  camera and speaker, including Bluetooth and USB headsets. Includes a mic level meter and a
+  speaker test. Your choice is remembered. Speaker choice works in Chrome, Edge and Firefox on
+  computers; phones and Safari use the device's current output.
 
 ## Tablets and phones
 - They can join, talk, chat and watch screen shares in the browser.
