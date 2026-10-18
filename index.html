@@ -67,6 +67,11 @@ input.code{font-family:var(--f-mono);letter-spacing:.04em}
 .tile .label{position:absolute;left:8px;bottom:8px;background:var(--scrim);padding:3px 9px;border-radius:6px;font-size:13px;display:flex;gap:6px;align-items:center;max-width:calc(100% - 60px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tile .res{position:absolute;left:8px;top:8px;font:12px/1.4 var(--f-mono);background:var(--scrim);padding:3px 8px;border-radius:5px;color:var(--accent);font-variant-numeric:tabular-nums;max-width:calc(100% - 16px)}
 .tile .res.lim{color:var(--warn)}
+/* delay readout: shown on hover, or always when the delay is high */
+.tile .lat{position:absolute;right:8px;top:8px;font:12px/1.4 var(--f-mono);background:var(--scrim);padding:3px 8px;border-radius:5px;color:var(--accent);font-variant-numeric:tabular-nums;opacity:0;transition:opacity .15s;z-index:3}
+.tile:hover .lat,.tile .lat.ok,.tile .lat.bad{opacity:1}
+.tile .lat.ok{color:var(--warn)}
+.tile .lat.bad{color:var(--danger)}
 .tile .fs{position:absolute;right:8px;bottom:8px;width:40px;height:40px;display:grid;place-items:center;background:var(--scrim);border-radius:8px;opacity:0;transition:opacity .15s}
 .tile:hover .fs,.tile .fs:focus-visible{opacity:1}
 @media (hover:none){.tile .fs{opacity:1}}
@@ -283,6 +288,21 @@ const $=id=>document.getElementById(id);
 
 /* ===================== STATE ===================== */
 const COARSE = matchMedia('(pointer:coarse)').matches;
+
+/* ===================== LOW LATENCY ===================== */
+/* Send voice and video as two separate streams. Browsers lip-sync tracks of the same stream by holding
+   the voice back until the video catches up, so a heavy 4K screen share used to delay everyone's voice.
+   Separate streams keep the voice on its own, fast path. */
+const AUDIO_STREAM = new MediaStream(), VIDEO_STREAM = new MediaStream();
+(function(){
+  const proto = window.RTCPeerConnection && RTCPeerConnection.prototype;
+  if(!proto||!proto.addTrack)return;
+  const orig = proto.addTrack;
+  proto.addTrack = function(track, ...streams){
+    if(streams.length && S && streams[0] === S.local) streams = [track.kind === 'audio' ? AUDIO_STREAM : VIDEO_STREAM];
+    return orig.call(this, track, ...streams);
+  };
+})();
 const CAN_SHARE = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 const IS_ANDROID = /Android/i.test(navigator.userAgent);
 const APP_SHARE = !CAN_SHARE && IS_ANDROID;   // Android: offer the app, which can share the screen
@@ -417,6 +437,7 @@ function makeTile(id,name,self){
    <div class="avatar" hidden><b></b></div>
    <div class="status" hidden></div>
    <span class="res" hidden></span>
+   <span class="lat" hidden></span>
    <div class="label"><span class="mi"></span><span class="nm"></span></div>
    <button class="fs" aria-label="Full screen">${I.fs}</button>`;
   t.querySelector('video').muted=true;
@@ -488,6 +509,7 @@ function removePeer(id,quiet){
   try{p.call&&p.call.close()}catch(e){}try{p.conn&&p.conn.close()}catch(e){}
   if(p.tile){if(fsElement()===p.tile)exitFs();p.tile.remove()}
   layout();
+  if(S.screen)for(const q of S.peers.values())applyVideoTrack(q);   // fewer viewers → more bitrate each
   if(!quiet&&p.gotHello)sysMsg(`${p.name} left`);
 }
 function broadcast(m){for(const p of S.peers.values())if(p.conn&&p.conn.open)try{p.conn.send(m)}catch(e){}}
@@ -508,7 +530,7 @@ function wireConn(conn){
       p.capH=Math.max(480,Math.min(2160,+m.cap||2160));p.remoteSharing=!!m.sharing;p.mic=m.mic!==false;
       ensureTile(p);setTileState(p.tile,{name:p.name,mic:m.mic,cam:m.cam,sharing:m.sharing});
       if(first)sysMsg(`${p.name} joined`);
-      if(S.screen)applyVideoTrack(p);
+      if(S.screen)for(const q of S.peers.values())applyVideoTrack(q);
     }
     else if(m.t==='roster'){(m.ids||[]).forEach(id=>connectTo(id))}
     else if(m.t==='state'){
@@ -523,11 +545,13 @@ function wireConn(conn){
   conn.on('error',()=>{});
 }
 function attachStream(p,s){
+  // Voice and video arrive as separate streams (see LOW LATENCY below), so route each by what it carries.
   const v=p.tile.querySelector('video'),a=p.tile.querySelector('audio');
-  if(v.srcObject!==s){v.srcObject=s;v.muted=true;v.play().catch(()=>{})}
-  if(a&&CAN_SINK&&DEV.spk)a.setSinkId(DEV.spk).catch(()=>{});
-  if(a&&a.srcObject!==s){a.srcObject=s;const r=a.play();if(r&&r.catch)r.catch(()=>{$('soundBtn').hidden=false})}
-  setStatus(p.tile,'');
+  const hasV=s.getVideoTracks().length>0,hasA=s.getAudioTracks().length>0;
+  if(hasV&&v.srcObject!==s){v.srcObject=s;v.muted=true;v.play().catch(()=>{})}
+  if(hasA&&a&&CAN_SINK&&DEV.spk)a.setSinkId(DEV.spk).catch(()=>{});
+  if(hasA&&a&&a.srcObject!==s){a.srcObject=s;const r=a.play();if(r&&r.catch)r.catch(()=>{$('soundBtn').hidden=false})}
+  if(hasV||!p.tile.querySelector('video').srcObject)setStatus(p.tile,'');
 }
 $('soundBtn').onclick=()=>{document.querySelectorAll('.tile audio').forEach(a=>{const r=a.play();if(r&&r.catch)r.catch(()=>{})});$('soundBtn').hidden=true};
 
@@ -622,7 +646,11 @@ async function applyVideoTrack(p){
       const cap=Math.min(p.capH||2160,m.h);
       const scale=Math.max(1,srcH/cap);
       e.scaleResolutionDownBy=scale;
-      e.maxBitrate=Math.round(Math.max(2.5e6,m.bitrate/(scale*scale)));
+      // Each viewer is a separate upload. Share one budget between them so the uplink doesn't queue up
+      // (a full uplink delays everything, voice included).
+      const viewers=Math.max(1,[...S.peers.values()].filter(x=>x.call).length);
+      const budget=Math.min(m.bitrate,m.bitrate*1.5/viewers);
+      e.maxBitrate=Math.round(Math.max(2.5e6,budget/(scale*scale)));
       e.maxFramerate=m.fps;
     }else{e.scaleResolutionDownBy=1;e.maxBitrate=CAM_BITRATE;e.maxFramerate=30}
     await sender.setParameters(prm);
@@ -693,6 +721,29 @@ function openInApp(){
 }
 document.addEventListener('pointerdown',e=>{if(!$('shareMenu').hidden&&!e.target.closest('#shareMenu,#shareBtn'))closeMenu()});
 
+/* ===================== DELAY READOUT ===================== */
+/* Rough mouth-to-ear delay for each person: half the network round trip + how long their voice
+   waits in our buffer + ~40 ms for capture, encoding and playback. Hover a tile to see it;
+   it stays visible in amber/red when it's high, with the main cause in the tooltip. */
+function showDelay(p,pair,ina){
+  const el=p.tile&&p.tile.querySelector('.lat');if(!el)return;
+  const rtt=pair&&pair.currentRoundTripTime!=null?pair.currentRoundTripTime*1000:null;
+  let jb=null;
+  if(ina&&ina.jitterBufferEmittedCount!=null){
+    if(p.prevJb){const n=ina.jitterBufferEmittedCount-p.prevJb.n;if(n>0)jb=(ina.jitterBufferDelay-p.prevJb.d)/n*1000}
+    p.prevJb={d:ina.jitterBufferDelay,n:ina.jitterBufferEmittedCount};
+  }
+  if(rtt==null){el.hidden=true;return}
+  const buf=jb!=null?jb:40;
+  const est=Math.round(rtt/2+buf+40);
+  el.hidden=false;
+  el.textContent=`${est} ms`;
+  el.className='lat'+(est>=300?' bad':est>=150?' ok':'');
+  const cause=rtt/2>buf?'mostly the network between you':'mostly buffering for an unsteady connection';
+  el.title=est<150?`About ${est} ms delay. That's good.`
+    :`About ${est} ms delay — network round trip ${Math.round(rtt)} ms, buffering ${Math.round(buf)} ms (${cause}).`;
+}
+
 /* ===================== LIVE STATS (resolution, fps, auto-adjust) ===================== */
 const STEPS=[1440,1080,720];
 async function statsTick(){
@@ -700,9 +751,13 @@ async function statsTick(){
   for(const p of S.peers.values()){
     const pc=p.call&&p.call.peerConnection;if(!pc||!p.tile)continue;
     let rep;try{rep=await pc.getStats()}catch(e){continue}
-    let inb=null,out=null;
+    let inb=null,out=null,ina=null,selPair=null;const pairs={};
     rep.forEach(s=>{if(s.kind==='video'||s.mediaType==='video'){if(s.type==='inbound-rtp')inb=s;if(s.type==='outbound-rtp')out=s}
-      else if(s.type==='inbound-rtp'&&(s.kind==='audio'||s.mediaType==='audio')&&typeof s.audioLevel==='number'){p.statLevel=s.audioLevel;p.statLevelAt=now}});
+      else if(s.type==='inbound-rtp'&&(s.kind==='audio'||s.mediaType==='audio')){ina=s;if(typeof s.audioLevel==='number'){p.statLevel=s.audioLevel;p.statLevelAt=now}}
+      if(s.type==='candidate-pair'){pairs[s.id]=s;if(s.selected||(s.nominated&&s.state==='succeeded'))selPair=selPair||s}
+      if(s.type==='transport'&&s.selectedCandidatePairId)selPair={ref:s.selectedCandidatePairId}});
+    if(selPair&&selPair.ref)selPair=pairs[selPair.ref]||null;
+    showDelay(p,selPair,ina);
     if(inb){
       const prev=p.prevIn;const dt=prev?(now-prev.t)/1000:0;
       const dec=inb.framesDecoded||0,drop=inb.framesDropped||0;

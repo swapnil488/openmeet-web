@@ -30,6 +30,16 @@ To update it later, drag the new folder onto your site's **Deploys** page.
   speaker test. Your choice is remembered. Speaker choice works in Chrome, Edge and Firefox on
   computers; phones and Safari use the device's current output.
 
+## Delay
+- Voice is sent separately from video, so a heavy 4K screen share no longer holds everyone's voice
+  back (in testing, voice delay during a 4K share dropped from ~137 ms to ~38 ms).
+- When presenting to several people, one upload budget is shared between them, so the uplink
+  doesn't clog and delay everything.
+- Hover a person's tile to see their delay. It stays visible in amber (150 ms+) or red (300 ms+),
+  and its tooltip says whether the network or buffering is the main cause.
+- The biggest remaining factor is the network: the distance between people and how loaded the
+  upload is. Wired or 5 GHz Wi-Fi helps; uploading other things during a call hurts.
+
 ## Tablets and phones
 - They can join, talk, chat and watch screen shares in the browser.
 - **Android app:** the OpenMeet app joins the same meetings and can share the tablet's screen.
