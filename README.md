@@ -17,8 +17,11 @@ To update it later, drag the new folder onto your site's **Deploys** page.
 ## Using it
 - **New meeting** creates a code like `abc-defg-hij`. Use the link button to copy the invite.
 - **Share screen** opens a quality menu:
-  - **4K · Balanced** (default): smooth playback. It lowers detail briefly when the network or PC can't keep up.
-  - **4K · Sharpest text**: always full 4K. Good for code and documents, but motion can stutter.
+  - **4K · Auto** (default): full 4K when your computer keeps up. If encoding 4K is too slow (which is
+    what makes viewers see things late), it steps down to 1440p or 1080p by itself, and back up when
+    there's room. It never goes below 1080p, so text stays readable.
+  - **1080p · Lowest delay**: for live demos and remote help. Can go down to 720p to stay quick.
+  - **4K · Sharpest text**: always full 4K for code and documents. Can lag on slower computers.
   - **1440p · 60 fps**: for videos, games and fast scrolling.
   You can switch modes while presenting.
 - The badge on a shared screen shows the real resolution and fps. On the presenter's side
@@ -31,6 +34,10 @@ To update it later, drag the new folder onto your site's **Deploys** page.
   computers; phones and Safari use the device's current output.
 
 ## Delay
+- **Screen sharing delay** comes mostly from the presenter's computer encoding each 4K frame and
+  the viewer's browser buffering big frames. In testing on a slow machine, Auto mode cut the
+  screen-to-screen delay from about 0.9 s to about 0.3 s (scrolling) and 0.6 s to about 0.27 s
+  (typing). Lowest delay mode got about 0.24 s. Computers with hardware video encoding do better.
 - Voice is sent separately from video, so a heavy 4K screen share no longer holds everyone's voice
   back (in testing, voice delay during a 4K share dropped from ~137 ms to ~38 ms).
 - When presenting to several people, one upload budget is shared between them, so the uplink

@@ -215,8 +215,9 @@ a.btn{text-decoration:none;color:var(--fg);display:inline-block}
 
 <div id="shareMenu" class="menu" hidden role="menu" aria-label="Screen share quality">
   <div class="menu-title">Screen share quality</div>
-  <button class="opt" role="menuitemradio" data-mode="balanced"><b>4K · Balanced</b><span>Smooth playback. Lowers detail briefly when the network or PC can't keep up.</span></button>
-  <button class="opt" role="menuitemradio" data-mode="sharp"><b>4K · Sharpest text</b><span>Keeps full 4K for code, docs and slides. Motion can stutter.</span></button>
+  <button class="opt" role="menuitemradio" data-mode="balanced"><b>4K · Auto</b><span>Full 4K when your computer keeps up. Steps down to 1440p or 1080p by itself to keep the delay low.</span></button>
+  <button class="opt" role="menuitemradio" data-mode="fast"><b>1080p · Lowest delay</b><span>For live demos and remote help. Text is a little softer.</span></button>
+  <button class="opt" role="menuitemradio" data-mode="sharp"><b>4K · Sharpest text</b><span>Always full 4K for code and documents. Can lag on slower computers.</span></button>
   <button class="opt" role="menuitemradio" data-mode="smooth"><b>1440p · 60 fps</b><span>Videos, games and fast scrolling.</span></button>
   <div id="appShare" hidden>
     <button class="opt" id="appOpenBtn" role="menuitem"><b>Switch to the OpenMeet app</b><span>Browsers on Android can't share the screen. The app can. You'll rejoin this meeting there.</span></button>
@@ -262,9 +263,10 @@ const CFG = Object.assign({
 }, window.OPENMEET_CONFIG || {});
 
 const SHARE_MODES = {
-  balanced: {label:'4K · Balanced',      w:3840, h:2160, fps:30, bitrate:16e6, hint:'detail', pref:'balanced'},
-  sharp:    {label:'4K · Sharpest text', w:3840, h:2160, fps:30, bitrate:20e6, hint:'text',   pref:'maintain-resolution'},
-  smooth:   {label:'1440p · 60 fps',     w:2560, h:1440, fps:60, bitrate:12e6, hint:'motion', pref:'maintain-framerate'},
+  balanced: {label:'4K · Auto',            w:3840, h:2160, fps:30, bitrate:16e6, hint:'detail', pref:'balanced',           adapt:true, minH:1080},
+  fast:     {label:'1080p · Lowest delay', w:1920, h:1080, fps:30, bitrate:6e6,  hint:'motion', pref:'maintain-framerate', adapt:true, minH:720},
+  sharp:    {label:'4K · Sharpest text',   w:3840, h:2160, fps:30, bitrate:20e6, hint:'text',   pref:'maintain-resolution', adapt:false},
+  smooth:   {label:'1440p · 60 fps',       w:2560, h:1440, fps:60, bitrate:12e6, hint:'motion', pref:'maintain-framerate', adapt:true, minH:1080},
 };
 const CAM_BITRATE = 1_500_000;
 const PREFIX = 'openmeet-v1-';
@@ -643,7 +645,7 @@ async function applyVideoTrack(p){
     const e=prm.encodings[0];
     if(m){
       const srcH=(track.getSettings&&track.getSettings().height)||m.h;
-      const cap=Math.min(p.capH||2160,m.h);
+      const cap=Math.min(p.capH||2160,m.h,m.adapt&&S.shareStep!=null?AUTO_STEPS[S.shareStep]:2160);
       const scale=Math.max(1,srcH/cap);
       e.scaleResolutionDownBy=scale;
       // Each viewer is a separate upload. Share one budget between them so the uplink doesn't queue up
@@ -660,7 +662,7 @@ async function applyVideoTrack(p){
 function shareConstraints(m){return {width:{ideal:m.w,max:3840},height:{ideal:m.h,max:2160},frameRate:{ideal:m.fps,max:m.fps}}}
 function saveMode(k){S.modeKey=k;try{localStorage.setItem('om-mode',k)}catch(e){}}
 async function startShare(key){
-  saveMode(key);const m=SHARE_MODES[key];
+  saveMode(key);const m=SHARE_MODES[key];resetAuto();
   let s;
   try{s=await navigator.mediaDevices.getDisplayMedia({video:shareConstraints(m),audio:false})}catch(e){return}
   const track=s.getVideoTracks()[0];
@@ -674,7 +676,7 @@ async function startShare(key){
   syncButtons();updateSelfTile();broadcast(myState());
 }
 async function changeMode(key){
-  saveMode(key);const m=SHARE_MODES[key];const track=S.screen.getVideoTracks()[0];
+  saveMode(key);const m=SHARE_MODES[key];const track=S.screen.getVideoTracks()[0];resetAuto();
   try{track.contentHint=m.hint}catch(e){}
   try{await track.applyConstraints(shareConstraints(m))}catch(e){}
   for(const p of S.peers.values())applyVideoTrack(p);
@@ -720,6 +722,34 @@ function openInApp(){
   },2500);
 }
 document.addEventListener('pointerdown',e=>{if(!$('shareMenu').hidden&&!e.target.closest('#shareMenu,#shareBtn'))closeMenu()});
+
+/* ===================== SCREEN SHARE: AUTO RESOLUTION FOR LOW DELAY ===================== */
+/* If this computer takes too long to encode each frame, frames pile up and viewers see things late.
+   Browsers often keep sending full 4K at a few frames per second instead, so we step down ourselves:
+   4K → 1440p → 1080p → 720p, and back up once there's clearly room again. */
+const AUTO_STEPS=[2160,1440,1080,720];
+function stepRange(m){
+  const top=AUTO_STEPS.findIndex(h=>h<=m.h);const floor=AUTO_STEPS.indexOf(m.minH||m.h);
+  return {top:Math.max(0,top),floor:Math.max(top,floor)};
+}
+function resetAuto(){const m=SHARE_MODES[S.modeKey];S.shareStep=stepRange(m).top;S.slowTicks=0;S.fastTicks=0;S.autoTold=false}
+function autoTick(encMs,cpuLimited,sentH){
+  const m=S.screen&&SHARE_MODES[S.modeKey];if(!m||!m.adapt||encMs==null)return;
+  const {top,floor}=stepRange(m);
+  const step=S.shareStep==null?top:S.shareStep;
+  S.slowTicks=(encMs>40||cpuLimited)?(S.slowTicks||0)+1:0;
+  // only step back up if the bigger size would still encode quickly (cost grows with the pixel count)
+  const up=step>top?AUTO_STEPS[step-1]/AUTO_STEPS[step]:0;
+  S.fastTicks=(step>top&&!cpuLimited&&encMs*up*up<28)?(S.fastTicks||0)+1:0;
+  if(S.slowTicks>=2&&step<floor){
+    S.shareStep=step+1;S.slowTicks=0;S.fastTicks=0;
+    for(const p of S.peers.values())applyVideoTrack(p);
+    if(!S.autoTold){S.autoTold=true;toast(`Lowered your screen share to ${AUTO_STEPS[step+1]}p to keep the delay down. This computer couldn't encode ${sentH||AUTO_STEPS[step]}p fast enough.`,6000)}
+  }else if(S.fastTicks>=10){
+    S.shareStep=step-1;S.slowTicks=0;S.fastTicks=0;
+    for(const p of S.peers.values())applyVideoTrack(p);
+  }
+}
 
 /* ===================== DELAY READOUT ===================== */
 /* Rough mouth-to-ear delay for each person: half the network round trip + how long their voice
@@ -773,9 +803,19 @@ async function statsTick(){
       p.prevIn={t:now,dec,drop};
     }
     p.outInfo=out?{w:out.frameWidth,h:out.frameHeight,fps:out.framesPerSecond,lim:out.qualityLimitationReason}:null;
+    if(out&&out.totalEncodeTime!=null){
+      const pe=p.prevEnc;
+      if(pe){const n=out.framesEncoded-pe.n;p.encMs=n>=2?(out.totalEncodeTime-pe.t)/n*1000:null}
+      p.prevEnc={t:out.totalEncodeTime,n:out.framesEncoded};
+    }
     const r=p.tile.querySelector('.res');
     if(p.tile.classList.contains('sharing')&&p.inInfo&&p.inInfo.w){r.hidden=false;r.className='res';r.textContent=`${p.inInfo.w}×${p.inInfo.h} · ${Math.round(p.inInfo.fps||0)} fps`}
     else r.hidden=true;
+  }
+  if(S.screen){
+    const encs=[...S.peers.values()].map(p=>p.encMs).filter(x=>x!=null);
+    const outsH=[...S.peers.values()].map(p=>p.outInfo&&p.outInfo.h).filter(Boolean);
+    autoTick(encs.length?Math.max(...encs):null,[...S.peers.values()].some(p=>p.outInfo&&p.outInfo.lim==='cpu'),outsH.length?Math.max(...outsH):0);
   }
   const st=selfTile();
   if(st){
@@ -785,7 +825,9 @@ async function statsTick(){
       r.hidden=false;
       if(outs.length){
         const o=outs[0];const lim=o.lim&&o.lim!=='none'?(o.lim==='cpu'?'limited by your computer':'limited by your network'):'';
-        r.textContent=`Sending ${o.w}×${o.h} · ${Math.round(o.fps||0)} fps${lim?' · '+lim:''}`;r.className='res'+(lim?' lim':'');
+        const mm=SHARE_MODES[S.modeKey];
+        const auto=mm.adapt&&S.shareStep>stepRange(mm).top?' · lowered for less delay':'';
+        r.textContent=`Sending ${o.w}×${o.h} · ${Math.round(o.fps||0)} fps${lim?' · '+lim:auto}`;r.className='res'+(lim?' lim':'');
       }else{const s=S.screen.getVideoTracks()[0].getSettings();r.className='res';r.textContent=`${s.width}×${s.height} · waiting for viewers`}
     }else r.hidden=true;
   }
