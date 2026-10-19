@@ -32,6 +32,18 @@ To update it later, drag the new folder onto your site's **Deploys** page.
   camera and speaker, including Bluetooth and USB headsets. Includes a mic level meter and a
   speaker test. Your choice is remembered. Speaker choice works in Chrome, Edge and Firefox on
   computers; phones and Safari use the device's current output.
+- **Snap to dust** (turn it on in Audio & video settings): with your camera on, snap your fingers
+  with your hand in view and you crumble into dust that blows away, leaving the empty room behind.
+  Snap again and the dust flies back and you reappear. It's drawn into your video, so everyone sees
+  it, including people on the app. **Try it** in the same settings does it without snapping.
+  - It learns what the room behind you looks like while you're on camera, so a minute on camera
+    before the first snap gives a cleaner empty room. Spots it never saw are blended from around them.
+  - To avoid false alarms it only reacts to a sharp, single click on the mic while a hand is raised
+    in the picture. Talking, typing, applause, knocks, music and notification sounds are ignored.
+    A single loud clap or key press with your hand up can still count, so snap again to come back.
+  - Works in Chrome, Edge and Firefox on computers (needs WebGL 2). The first time, it downloads about
+    20 MB of person- and hand-detection models (cached afterwards). It uses extra CPU/GPU while on, so
+    leave it off on slow laptops.
 
 ## Delay
 - **Screen sharing delay** comes mostly from the presenter's computer encoding each 4K frame and

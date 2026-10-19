@@ -101,6 +101,13 @@ select{width:100%;background:var(--tile);border:1px solid var(--line);border-rad
 .sel-row select{flex:1}
 .meter{height:6px;border-radius:3px;background:var(--tile);margin-top:8px;overflow:hidden}
 .meter i{display:block;height:100%;width:0;background:var(--accent);border-radius:3px;transition:width .08s linear}
+.fx-field{border-top:1px solid var(--line);margin-top:18px;padding-top:16px}
+.fx-row{display:flex;gap:12px;align-items:flex-start;text-transform:none;letter-spacing:0;font-size:15px;color:var(--fg);cursor:pointer;margin:0}
+.fx-row input{width:20px;height:20px;margin:2px 0 0;accent-color:var(--accent);flex:none;padding:0}
+.fx-row small{display:block;color:var(--muted);font-size:13px;margin-top:3px;line-height:1.45}
+.fx-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:10px}
+.fx-foot .note{margin:0}
+.fx-foot .btn{padding:8px 14px;flex:none}
 
 .bar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line);background:var(--stage);flex-wrap:wrap}
 .bar .meta{font-family:var(--f-mono);font-size:13px;color:var(--muted);display:flex;gap:10px;align-items:center;min-width:0;flex:1}
@@ -244,6 +251,10 @@ a.btn{text-decoration:none;color:var(--fg);display:inline-block}
       <select id="camSel"></select>
     </div>
     <p class="note" id="devNote">Bluetooth and USB headsets appear here once they're connected.</p>
+    <div class="fx-field">
+      <label class="fx-row" for="fxToggle"><input type="checkbox" id="fxToggle"><span><b>Snap to dust</b><small>Snap your fingers on camera to crumble into dust. Snap again to come back. Everyone in the meeting sees it.</small></span></label>
+      <div class="fx-foot"><span class="note" id="fxStatus"></span><button class="btn btn-ghost" id="fxTry" disabled>Try it</button></div>
+    </div>
   </div>
 </div>
 
@@ -395,7 +406,7 @@ function syncButtons(){
 }
 function myState(){return {t:'state',mic:S.micOn,cam:S.camOn,sharing:!!S.screen}}
 function toggleMic(){const t=S.local&&S.local.getAudioTracks()[0];if(!t){toast('No microphone found');return}S.micOn=!S.micOn;t.enabled=S.micOn;syncButtons();updateSelfTile();broadcast(myState())}
-function toggleCam(){if(!S.camTrack){toast('No camera found');return}S.camOn=!S.camOn;S.camTrack.enabled=S.camOn;syncButtons();updateSelfTile();broadcast(myState())}
+function toggleCam(){if(!S.camTrack){toast('No camera found');return}S.camOn=!S.camOn;S.camTrack.enabled=S.camOn;if(!S.camOn)fxReset();syncButtons();updateSelfTile();broadcast(myState())}
 $('pvMic').onclick=toggleMic;$('pvCam').onclick=toggleCam;$('micBtn').onclick=toggleMic;$('camBtn').onclick=toggleCam;
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){document.querySelectorAll('.tile.max').forEach(t=>t.classList.remove('max'));closeMenu();syncFs()}
@@ -629,10 +640,11 @@ function enterMeeting(){
   $('pv').srcObject=null;
   updateSelfTile();syncButtons();syncFs();layout();
   sysMsg(S.isHost?'Meeting started. Copy the link to invite people.':'You joined the meeting.');
+  syncFxUi();if(fxSaved()&&!FX.on)fxEnable();
 }
 
 /* ===================== SCREEN SHARE ===================== */
-function currentOutgoingVideo(){return S.screen?S.screen.getVideoTracks()[0]:(S.camTrack||S.blankTrack)}
+function currentOutgoingVideo(){return S.screen?S.screen.getVideoTracks()[0]:(FX.out||S.camTrack||S.blankTrack)}
 async function applyVideoTrack(p){
   const pc=p.call&&p.call.peerConnection;if(!pc)return;
   const sender=pc.getSenders().find(s=>s.track&&s.track.kind==='video');
@@ -922,7 +934,7 @@ async function switchMic(id,auto){
     if(!hadMic)S.micOn=true;
     nt.enabled=S.micOn;
     if(old){S.local.removeTrack(old);old.stop()}
-    S.local.addTrack(nt);watchTrack(nt,'mic');
+    S.local.addTrack(nt);watchTrack(nt,'mic');fxMicChanged();
     for(const p of S.peers.values()){const snd=senderFor(p,'audio');if(snd)snd.replaceTrack(nt).catch(()=>{})}
     if(!auto){DEV.mic=id;saveDev()}
     localAnalyserTrack=null;
@@ -940,7 +952,7 @@ async function switchCam(id,auto){
     if(!old){S.camOn=true;if(S.blankTrack)S.local.removeTrack(S.blankTrack)}
     nt.enabled=S.camOn;
     if(old){S.local.removeTrack(old);old.stop()}
-    S.local.addTrack(nt);S.camTrack=nt;watchTrack(nt,'cam');
+    S.local.addTrack(nt);S.camTrack=nt;watchTrack(nt,'cam');fxCamChanged();
     for(const p of S.peers.values())applyVideoTrack(p);
     const st=selfTile();
     if(st&&!S.screen){const v=st.querySelector('video');v.srcObject=null;v.srcObject=S.local;v.play().catch(()=>{})}
@@ -1024,6 +1036,451 @@ if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener){
   });
   navigator.mediaDevices.enumerateDevices().then(a=>{known=new Set(a.map(d=>d.kind+d.deviceId))}).catch(()=>{});
 }
+
+/* ===================== SNAP TO DUST (camera effect) ===================== */
+/* Snap your fingers on camera → you crumble into ash that drifts away, leaving the empty room behind.
+   Snap again → the dust flies back and you reassemble. The effect is drawn into the video we send,
+   so everyone in the meeting sees it (website and app). Off by default: Audio & video settings.
+   How it works:
+   - A person cutout (MediaPipe selfie segmentation) separates you from the room.
+   - While you're visible, the room behind you is learned bit by bit, so it can be shown when you're gone;
+     never-seen spots are filled by blending the nearest room to their left, right, above and below.
+   - The dust is ~100k GPU particles, one per few pixels of you, coloured from your frame and turning to ash.
+   - A snap is a short, sharp, high-pitched click on the mic, while a hand is in view of the camera. */
+const MP_CDN='https://cdn.jsdelivr.net/npm/@mediapipe/';
+const MP_SEG='selfie_segmentation@0.1.1675465747', MP_HANDS='hands@0.4.1675469240';
+const FX={on:false,ready:false,state:'normal',t0:0,g:null,out:null,stream:null,track:null,video:null,
+  seg:null,hands:null,segBusy:false,handsBusy:false,lastSeg:0,lastHands:0,lastHandSeen:-1e9,lastFrame:0,
+  maskFresh:false,cover:0,seed:[0.5,0.3],maskA:1,audio:null,workletLoaded:false,toldHand:false,handUp:false};
+const FX_DUST_SPREAD=2.4,FX_DUST_LIFE=2.7,FX_BACK_SPREAD=1.9,FX_BACK_LEAD=0.9;
+
+function fxSaved(){try{return localStorage.getItem('om-fx')==='1'}catch(e){return false}}
+function fxSave(){try{localStorage.setItem('om-fx',FX.on?'1':'0')}catch(e){}}
+function fxStatus(t){const el=$('fxStatus');if(el)el.textContent=t||''}
+function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.crossOrigin='anonymous';s.onload=res;s.onerror=()=>rej(new Error("couldn't download "+src.split('/').pop()));document.head.appendChild(s)})}
+
+async function fxEnable(){
+  if(FX.on)return;
+  FX.on=true;fxSave();syncFxUi();
+  fxStatus('Loading the effect…');
+  try{
+    if(!window.WebGL2RenderingContext)throw new Error('this browser has no WebGL 2');
+    await Promise.all([window.SelfieSegmentation?0:loadScript(MP_CDN+MP_SEG+'/selfie_segmentation.js'),
+                       window.Hands?0:loadScript(MP_CDN+MP_HANDS+'/hands.js')]);
+    if(!FX.on)return;
+    if(!FX.seg){
+      FX.seg=new SelfieSegmentation({locateFile:f=>MP_CDN+MP_SEG+'/'+f});
+      FX.seg.setOptions({modelSelection:1,selfieMode:false});
+      FX.seg.onResults(r=>fxOnMask(r.segmentationMask));
+      await FX.seg.initialize();
+    }
+    if(!FX.hands){
+      FX.hands=new Hands({locateFile:f=>MP_CDN+MP_HANDS+'/'+f});
+      FX.hands.setOptions({maxNumHands:2,modelComplexity:0,minDetectionConfidence:0.5,minTrackingConfidence:0.5,selfieMode:false});
+      // a hand raised into the picture (not just resting on a keyboard at the bottom edge)
+      FX.hands.onResults(r=>{const hs=r.multiHandLandmarks||[];FX.handUp=hs.some(h=>h.some(p=>p.y<0.85));if(FX.handUp)FX.lastHandSeen=performance.now()});
+      await FX.hands.initialize();
+    }
+    if(!FX.on)return;
+    fxAttachVideo();
+    await fxStartAudio();
+    FX.ready=true;
+    fxStatus(FX.audio?'Ready. Snap your fingers with your hand in view of the camera.':'Ready. No microphone, so use "Try it" to snap.');
+    syncFxUi();
+    fxLoop();
+  }catch(e){
+    console.error(e);FX.on=false;FX.ready=false;fxSave();syncFxUi();
+    fxStatus("Couldn't start the effect: "+(e.message||e)+'.');
+  }
+}
+function fxDisable(){
+  FX.on=false;FX.ready=false;fxSave();
+  fxReset();fxStopAudio();
+  fxStatus('');syncFxUi();
+}
+/* back to the plain camera (camera turned off, screen share, effect switched off) */
+function fxReset(){
+  if(FX.state!=='normal'){FX.state='normal';fxSetOutgoing(false)}
+}
+function fxAttachVideo(){
+  const t=S.camTrack;if(!t)return;
+  if(!FX.video){
+    const v=document.createElement('video');v.muted=true;v.playsInline=true;v.setAttribute('playsinline','');v.setAttribute('aria-hidden','true');
+    Object.assign(v.style,{position:'fixed',left:'0',top:'0',width:'4px',height:'4px',opacity:'0.01',pointerEvents:'none',zIndex:'-1'});
+    document.body.appendChild(v);FX.video=v;
+  }
+  if(!FX.video.srcObject||FX.video.srcObject.getVideoTracks()[0]!==t){FX.video.srcObject=new MediaStream([t]);FX.video.play().catch(()=>{})}
+}
+function fxCamChanged(){if(FX.on){fxReset();fxAttachVideo()}}
+
+/* ---------- snap detection (audio) ---------- */
+const SNAP_WORKLET=`
+/* A finger snap is a loud, mostly high-pitched click that is over almost at once and stands alone.
+   Works on ~3 ms blocks of the high-passed (>1.2 kHz) mic signal. */
+class SnapDetector extends AudioWorkletProcessor{
+  constructor(){super();this.a=1/(1+2*Math.PI*1200/sampleRate);this.hp=0;this.px=0;this.floor=0.002;this.h=new Float32Array(1024);this.f=new Float32Array(1024);this.i=0;this.cand=-1;this.cool=0;}
+  at(j,a){const N=this.h.length;return (a||this.h)[((j%N)+N)%N];}
+  maxIn(a,b,arr){let m=0;for(let j=a;j<=b;j++)m=Math.max(m,this.at(j,arr));return m;}
+  process(inputs){
+    const ch=inputs[0]&&inputs[0][0];if(!ch)return true;
+    let eh=0,ef=0;
+    for(let k=0;k<ch.length;k++){const x=ch[k];const y=this.a*(this.hp+x-this.px);this.hp=y;this.px=x;eh+=y*y;ef+=x*x;}
+    eh=Math.sqrt(eh/ch.length);ef=Math.sqrt(ef/ch.length);
+    const bps=sampleRate/ch.length,ms=v=>Math.max(1,Math.round(v*bps/1000));
+    const i=this.i++;this.h[i%this.h.length]=eh;this.f[i%this.f.length]=ef;
+    if(this.cool>0)this.cool--;
+    // start of a possible snap: loud, sudden (4x what it was 5-8 ms ago), mostly high-pitched
+    const onset=this.cool===0&&eh>0.03&&eh>this.floor*5&&eh>4*Math.max(this.at(i-2),this.at(i-3))&&eh>ef*0.6;
+    if(this.cand<0){
+      if(onset)this.cand=i;else this.floor=this.floor*0.995+Math.min(eh,0.05)*0.005;
+    }else if(onset&&eh>2*this.maxIn(this.cand-1,i-1)){
+      this.cand=i;                                      // a much louder click (the snap after a 't' or a tap): judge that one instead
+    }else if(i-this.cand>=ms(450)){
+      const c=this.cand;this.cand=-1;
+      let pk=0,pi=c;for(let j=c-1;j<=c+ms(6);j++)if(this.at(j)>pk){pk=this.at(j);pi=j;}
+      let clicks=0;for(let j=pi+ms(50);j<=i;j++)if(this.at(j)>pk*0.2&&this.at(j)>3*Math.max(this.at(j-2),this.at(j-3))){clicks++;j+=ms(20);}   // typing: more clicks follow
+      const ring=this.maxIn(pi+ms(9),pi+ms(12))/pk;      // a snap has mostly died away after ~9 ms (beeps and notes haven't)
+      const tail=this.maxIn(pi+ms(30),pi+ms(50))/pk;     // ...and is gone after 30 ms (speech keeps going)
+      const after=this.maxIn(pi+ms(50),i)/pk;            // nothing as loud in the next 0.4 s (typing, clapping along)
+      const before=this.maxIn(c-ms(700),c-2)/pk;         // or in the 0.7 s before
+      let sh=0,sf=0;for(let j=pi-1;j<=pi+2;j++){sh+=this.at(j)**2;sf+=this.at(j,this.f)**2;}
+      const bright=Math.sqrt(sh/Math.max(sf,1e-12));   // share of the sound above ~1.2 kHz (snaps are bright; knocks, taps and claps less so)
+      const voice=this.maxIn(pi+ms(25),pi+ms(120),this.f)/this.at(pi,this.f);   // a 't' or 'k' in speech runs into a vowel
+      const ok=bright>0.76&&ring<0.4&&tail<0.4&&after<0.5&&before<0.6&&voice<0.7&&clicks<2;
+      this.port.postMessage({snap:ok,peak:pk,bright,ring,tail,after,before,voice,clicks});
+      if(ok)this.cool=ms(900);
+    }
+    return true;
+  }
+}
+registerProcessor('snap-detector',SnapDetector);`;
+async function fxStartAudio(){
+  fxStopAudio();
+  const t=S.local&&S.local.getAudioTracks()[0];if(!t)return;
+  const ctx=ensureAudioCtx();if(!ctx||!ctx.audioWorklet)return;
+  if(!FX.workletLoaded){await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([SNAP_WORKLET],{type:'text/javascript'})));FX.workletLoaded=true}
+  // a private copy of the mic: it still hears snaps while you're muted, and is never sent to anyone
+  const clone=t.clone();clone.enabled=true;
+  const src=ctx.createMediaStreamSource(new MediaStream([clone]));
+  const node=new AudioWorkletNode(ctx,'snap-detector');
+  const sink=ctx.createGain();sink.gain.value=0;
+  src.connect(node);node.connect(sink);sink.connect(ctx.destination);
+  node.port.onmessage=e=>{if(e.data&&e.data.snap)fxOnSnapSound()};
+  FX.audio={clone,src,node,sink,track:t};
+}
+function fxStopAudio(){
+  const a=FX.audio;if(!a)return;FX.audio=null;
+  try{a.src.disconnect();a.node.disconnect();a.sink.disconnect();a.node.port.onmessage=null}catch(e){}
+  try{a.clone.stop()}catch(e){}
+}
+function fxMicChanged(){if(FX.on&&FX.ready)fxStartAudio().catch(()=>{})}
+function fxOnSnapSound(){
+  if(!FX.ready||!S.peer||!S.camOn||S.screen)return;
+  // a hand up in the latest check, or in the last 1.2 s (the hand may drop right after the snap)
+  if(!FX.handUp&&performance.now()-FX.lastHandSeen>1200){
+    if(!FX.toldHand){FX.toldHand=true;toast('Heard a snap. Keep your hand in view of the camera to use the snap effect.',4500)}
+    return;
+  }
+  fxTrigger('snap');
+}
+
+/* ---------- state machine ---------- */
+function fxTrigger(source){
+  if(!FX.ready||!FX.g)return false;
+  if(!S.camOn||!S.camTrack||S.screen){if(source==='button')toast('Turn your camera on first.');return false}
+  const now=performance.now();
+  if(FX.state==='normal'){
+    if(FX.cover<0.02){if(source==='button')toast("The effect can't see you on camera yet.");return false}
+    FX.g.snapshot(FX.video);FX.g.seed(FX.seed);
+    FX.state='dust';FX.t0=now;FX.g.render(1,0);
+    fxSetOutgoing(true);
+    return true;
+  }
+  if(FX.state==='gone'){
+    FX.g.snapshot(FX.video);
+    FX.state='back';FX.t0=now;
+    return true;
+  }
+  return false;   // mid-animation
+}
+function fxAdvance(t){
+  if(FX.state==='dust'&&t>0.1+FX_DUST_SPREAD+FX_DUST_LIFE)FX.state='gone';
+  else if(FX.state==='back'&&t>FX_BACK_LEAD+FX_BACK_SPREAD+0.2){FX.state='normal';fxSetOutgoing(false)}
+}
+function fxSetOutgoing(on){
+  FX.out=on?FX.track:null;
+  for(const p of S.peers.values())applyVideoTrack(p);
+  fxSyncSelfView();
+}
+function fxSyncSelfView(){
+  const st=selfTile();if(!st||S.screen)return;
+  const v=st.querySelector('video');const want=FX.out?FX.stream:S.local;
+  if(v.srcObject!==want){v.srcObject=want;v.play().catch(()=>{})}
+}
+
+/* ---------- frame loop ---------- */
+function fxLoop(){
+  if(!FX.on)return;
+  if(document.hidden)setTimeout(fxLoop,40);else requestAnimationFrame(fxLoop);
+  const now=performance.now();
+  if(now-FX.lastFrame<30)return;            // ~30 fps
+  FX.lastFrame=now;
+  try{fxFrame(now)}catch(e){console.error(e)}
+}
+function fxFrame(now){
+  const v=FX.video;if(!v||!v.videoWidth||v.readyState<2)return;
+  const active=FX.state!=='normal';
+  const camLive=S.camOn&&!S.screen;
+  if(!camLive&&active)fxReset();
+  if(window.FX_TEST_MASK){fxOnMask(window.FX_TEST_MASK)}
+  else if(FX.seg&&!FX.segBusy&&(active||now-FX.lastSeg>180)){
+    FX.segBusy=true;FX.lastSeg=now;
+    FX.seg.send({image:v}).catch(()=>{}).finally(()=>{FX.segBusy=false});
+  }
+  if(window.FX_TEST_HAND){FX.lastHandSeen=now;FX.handUp=true}
+  else if(FX.hands&&camLive&&!FX.handsBusy&&(FX.state==='normal'||FX.state==='gone')&&now-FX.lastHands>220){
+    FX.handsBusy=true;FX.lastHands=now;
+    FX.hands.send({image:v}).catch(()=>{}).finally(()=>{FX.handsBusy=false});
+  }
+  const g=fxGL(v.videoWidth,v.videoHeight);if(!g||!g.hasMask)return;
+  if(FX.maskFresh||active){g.uploadLive(v)}
+  if(FX.maskFresh){FX.maskFresh=false;g.updateBg(active?0.08:0.2)}
+  if(active){const t=(now-FX.t0)/1000;g.render(FX.state==='dust'?1:FX.state==='gone'?2:3,t);fxAdvance(t)}
+}
+/* every new person mask: upload it, and measure how much of the frame is you + where to start the dust */
+const fxSmall=document.createElement('canvas');fxSmall.width=48;fxSmall.height=27;
+const fxSmallCtx=fxSmall.getContext('2d',{willReadFrequently:true});
+function fxOnMask(mask){
+  if(!mask||!FX.video||!FX.video.videoWidth)return;
+  const g=fxGL(FX.video.videoWidth,FX.video.videoHeight);if(!g)return;
+  fxSmallCtx.clearRect(0,0,48,27);fxSmallCtx.drawImage(mask,0,0,48,27);
+  const d=fxSmallCtx.getImageData(0,0,48,27).data;
+  let minA=255,maxR=0,maxA=0;
+  for(let i=0;i<d.length;i+=4){if(d[i+3]<minA)minA=d[i+3];if(d[i]>maxR)maxR=d[i];if(d[i+3]>maxA)maxA=d[i+3]}
+  FX.maskA=(minA<250&&maxA>0)?1:0;            // the cutout lives in alpha (or in red on some builds)
+  let n=0,top=27,bot=0;const pts=[];
+  for(let y=0;y<27;y++)for(let x=0;x<48;x++){const k=(y*48+x)*4;const m=(FX.maskA?d[k+3]:d[k])/255;if(m>0.5){n++;if(y<top)top=y;if(y>bot)bot=y;pts.push([x,y])}}
+  FX.cover=n/(48*27);
+  if(pts.length){
+    const cut=top+(bot-top)*0.55;const upper=pts.filter(p=>p[1]<=cut);const p=(upper.length?upper:pts)[Math.floor(Math.random()*(upper.length||pts.length))];
+    FX.seed=[(p[0]+0.5)/48,(p[1]+0.5)/27];
+  }
+  g.uploadMask(mask,FX.maskA);FX.maskFresh=true;
+}
+
+/* ---------- WebGL ---------- */
+const FX_GLSL_COMMON=`
+float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+  return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);}
+float fbm(vec2 p){float a=.5,s=0.;for(int i=0;i<4;i++){s+=a*vnoise(p);p*=2.03;a*=.5;}return s/.9375;}
+uniform vec2 uSeed;uniform float uSpread,uLead,uMaskA;
+float orderAt(vec2 p){float n=fbm(p*vec2(7.,4.)+uSeed*3.);float d=distance(p*vec2(1.7,1.),uSeed*vec2(1.7,1.));return clamp(.5*n+.65*d,0.,1.15)/1.15;}
+float releaseT(vec2 p){return .1+orderAt(p)*uSpread;}
+float arriveT(vec2 p){return uLead+(1.-orderAt(p))*uSpread;}
+float mk(sampler2D s,vec2 p){vec4 c=texture(s,p);return mix(c.r,c.a,uMaskA);}
+uniform float uAsp;
+// the cutout grown by r (a round brush, so diagonal edges and hair are covered too)
+float dil(sampler2D s,vec2 p,float r){float m=mk(s,p);
+  for(int i=0;i<8;i++){float a=float(i)*.7854;vec2 o=vec2(cos(a),sin(a)*uAsp)*r;m=max(m,max(mk(s,p+o),mk(s,p+o*.5)));}
+  return m;}
+`;
+const FX_VS_QUAD=`#version 300 es
+in vec2 aP;out vec2 vUv;void main(){vUv=aP*.5+.5;gl_Position=vec4(aP,0.,1.);}`;
+const FX_FS_BG=`#version 300 es
+precision highp float;in vec2 vUv;out vec4 o;
+uniform sampler2D uLive,uMask,uPrev;uniform float uRate;
+${FX_GLSL_COMMON}
+void main(){vec2 iu=vec2(vUv.x,1.-vUv.y);
+  float bgw=1.-smoothstep(.1,.3,dil(uMask,iu,.035));       // only learn pixels well away from you
+  vec4 p=texture(uPrev,vUv);vec3 c=texture(uLive,iu).rgb;
+  float k=p.a<.5?step(.5,bgw):uRate*bgw;
+  o=vec4(mix(p.rgb,c,k),max(p.a,step(.5,bgw)));}`;
+/* what's known about the room right now: the live picture away from you, or the learned room behind you */
+const FX_FS_SRC=`#version 300 es
+precision highp float;in vec2 vUv;out vec4 o;
+uniform sampler2D uLive,uMask,uBg;uniform vec2 uTex;
+${FX_GLSL_COMMON}
+void main(){vec2 iu=vec2(vUv.x,1.-vUv.y);
+  float away=step(.5,1.-smoothstep(.1,.3,dil(uMask,iu,.03)));
+  vec2 q=uTex*.25;
+  vec3 live=.25*(texture(uLive,iu+q).rgb+texture(uLive,iu-q).rgb+texture(uLive,iu+vec2(q.x,-q.y)).rgb+texture(uLive,iu+vec2(-q.x,q.y)).rgb);
+  vec4 b=texture(uBg,vUv);vec3 bc=b.rgb/max(b.a,.01);       // not-yet-learned spots are black with alpha 0
+  float useBg=(1.-away)*step(.6,b.a);float a=away+useBg;
+  o=vec4((live*away+bc*useBg)*a,a);}`;
+/* the hole where you were: blend the nearest known room to the left, right, above and below */
+const FX_FS_FILL=`#version 300 es
+precision highp float;in vec2 vUv;out vec4 o;
+uniform sampler2D uSrc;uniform vec2 uTex;
+void main(){
+  vec4 c=texture(uSrc,vUv);
+  if(c.a>.99){o=vec4(c.rgb/c.a,1.);return;}
+  vec3 acc=vec3(0.);float ws=0.;
+  for(int d=0;d<4;d++){
+    vec2 st=(d==0?vec2(1.,0.):d==1?vec2(-1.,0.):d==2?vec2(0.,1.):vec2(0.,-1.))*uTex*1.25;
+    vec2 p=vUv;
+    for(int i=1;i<=160;i++){
+      p+=st;if(p.x<0.||p.x>1.||p.y<0.||p.y>1.)break;
+      vec4 s=textureLod(uSrc,p,1.);
+      if(s.a>.75){float w=1./float(i*i);acc+=w*s.rgb/s.a;ws+=w;break;}
+    }
+  }
+  vec4 g=textureLod(uSrc,vec2(.5),20.);
+  vec3 f=ws>0.?acc/ws:(g.a>.01?g.rgb/g.a:vec3(.12));
+  o=vec4(c.a>.01?mix(f,c.rgb/c.a,c.a):f,1.);}`;
+const FX_FS_COPY=`#version 300 es
+precision highp float;in vec2 vUv;out vec4 o;uniform sampler2D uSrc;
+void main(){o=texture(uSrc,vec2(vUv.x,1.-vUv.y));}`;
+const FX_FS_COMP=`#version 300 es
+precision highp float;in vec2 vUv;out vec4 o;
+uniform sampler2D uLive,uMask,uFill,uSnap,uSnapMask;uniform float uT;uniform int uMode;
+${FX_GLSL_COMMON}
+void main(){vec2 iu=vec2(vUv.x,1.-vUv.y);
+  vec3 live=texture(uLive,iu).rgb;
+  vec3 bg=mix(live,texture(uFill,vUv).rgb,smoothstep(.1,.4,dil(uMask,iu,.02)));   // the room without you
+  vec3 col=bg;vec3 ash=vec3(.34,.31,.28);
+  if(uMode==1){                       // turning to dust (you, frozen at the snap)
+    float pm=smoothstep(.3,.6,mk(uSnapMask,vec2(vUv.x,vUv.y)));
+    float left=releaseT(iu)-uT;
+    vec3 pc=texture(uSnap,vUv).rgb;
+    pc=mix(pc,ash*(.8+.4*h21(iu*900.)),(1.-smoothstep(0.,.45,left))*.75);
+    col=mix(bg,pc,pm*step(0.,left-.14*h21(iu*731.)));     // grainy, crumbling edge
+  }else if(uMode==3){                 // coming back (you, live)
+    float pm=smoothstep(.3,.6,mk(uMask,iu));
+    float since=uT-arriveT(iu);
+    vec3 pc=mix(ash,live,smoothstep(0.,.5,since));
+    col=mix(bg,pc,pm*step(0.,since-.14*h21(iu*731.)));
+  }
+  o=vec4(col,1.);}`;
+const FX_VS_DUST=`#version 300 es
+precision highp float;in vec2 aG;
+uniform sampler2D uSnap,uSnapMask;uniform float uT,uAspect,uPx;uniform int uMode;
+out vec4 vC;
+${FX_GLSL_COMMON}
+void main(){vC=vec4(0.);gl_Position=vec4(2.,2.,0.,1.);gl_PointSize=0.;
+  vec2 tu=vec2(aG.x,1.-aG.y);                    // snapshot textures are stored upright
+  if(mk(uSnapMask,tu)<.5)return;
+  float age=uMode==1?uT-releaseT(aG):arriveT(aG)-uT;
+  if(age<=0.)return;
+  float h1=h21(aG*917.3),h2=h21(aG*311.7+3.1),h3=h21(aG*57.1+9.2);
+  vec2 wind=normalize(vec2(1.,-.35-.6*h2));        // drifts right and up
+  float sp=.045+.12*h1;
+  vec2 off=wind*sp*(age+.8*age*age);
+  off+=vec2(sin(age*2.6+h3*31.),cos(age*2.1+h1*17.))*.014*age;
+  off.y*=uAspect;
+  vec2 p=aG+off;
+  float a=(1.-smoothstep(.8,2.7,age))*(.55+.45*h2);
+  if(a<=.01)return;
+  vec3 c=texture(uSnap,tu).rgb;
+  c=mix(c,vec3(.36,.32,.28)*(.75+.5*h3),smoothstep(0.,.9,age));   // colour fades to ash
+  vC=vec4(c,a);
+  gl_Position=vec4(p.x*2.-1.,1.-p.y*2.,0.,1.);
+  gl_PointSize=uPx*(.6+.9*h1)*(1.-.35*smoothstep(0.,2.5,age));}`;
+const FX_FS_DUST=`#version 300 es
+precision mediump float;in vec4 vC;out vec4 o;
+void main(){float r=length(gl_PointCoord-.5);o=vec4(vC.rgb,vC.a*smoothstep(.5,.15,r));}`;
+
+function fxGL(w,h){
+  if(FX.g&&FX.g.w===w&&FX.g.h===h)return FX.g;
+  if(FX.g)FX.g.destroy();
+  FX.g=makeFxGL(w,h);
+  return FX.g;
+}
+function makeFxGL(w,h){
+  const canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+  const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,premultipliedAlpha:false,preserveDrawingBuffer:false,powerPreference:'high-performance'});
+  if(!gl)return null;
+  const sh=(type,src)=>{const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s};
+  const prog=(vs,fs)=>{const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));
+    const u={};const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);for(let i=0;i<n;i++){const a=gl.getActiveUniform(p,i);u[a.name]=gl.getUniformLocation(p,a.name)}return {p,u}};
+  const P={bg:prog(FX_VS_QUAD,FX_FS_BG),src:prog(FX_VS_QUAD,FX_FS_SRC),fill:prog(FX_VS_QUAD,FX_FS_FILL),copy:prog(FX_VS_QUAD,FX_FS_COPY),comp:prog(FX_VS_QUAD,FX_FS_COMP),dust:prog(FX_VS_DUST,FX_FS_DUST)};
+  const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const qva=gl.createVertexArray();gl.bindVertexArray(qva);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  for(const k in P)gl.bindAttribLocation(P[k].p,0,k==='dust'?'aG':'aP');
+  for(const k in P){gl.linkProgram(P[k].p);const u={};const n=gl.getProgramParameter(P[k].p,gl.ACTIVE_UNIFORMS);for(let i=0;i<n;i++){const a=gl.getActiveUniform(P[k].p,i);u[a.name]=gl.getUniformLocation(P[k].p,a.name)}P[k].u=u}
+  // one particle every `step` pixels
+  const step=Math.max(2,Math.round(w/430));const cols=Math.floor(w/step),rows=Math.floor(h/step);
+  const grid=new Float32Array(cols*rows*2);let k=0;for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){grid[k++]=(x+.5)/cols;grid[k++]=(y+.5)/rows}
+  const gbuf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,gbuf);gl.bufferData(gl.ARRAY_BUFFER,grid,gl.STATIC_DRAW);
+  const gva=gl.createVertexArray();gl.bindVertexArray(gva);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+  const tex=(tw,th,levels)=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+    if(tw){gl.texStorage2D(gl.TEXTURE_2D,levels||1,gl.RGBA8,tw,th)}
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,levels>1?gl.LINEAR_MIPMAP_LINEAR:gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t};
+  const fbo=t=>{const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);gl.bindFramebuffer(gl.FRAMEBUFFER,null);return f};
+  const bw=Math.max(16,w>>1),bh=Math.max(16,h>>1);
+  const fw=256,fh=Math.max(16,Math.round(256*h/w));               // the hole fill works on a small copy
+  const levels=Math.floor(Math.log2(Math.max(fw,fh)))+1;
+  const T={live:tex(),mask:tex(),snap:tex(w,h),snapMask:tex(256,256),bgA:tex(bw,bh),bgB:tex(bw,bh),src:tex(fw,fh,levels),fill:tex(fw,fh)};
+  const F={bgA:fbo(T.bgA),bgB:fbo(T.bgB),src:fbo(T.src),fill:fbo(T.fill),snap:fbo(T.snap),snapMask:fbo(T.snapMask)};
+  for(const f of [F.bgA,F.bgB]){gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT)}
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  let bgCur='A',maskA=1,seed=[.5,.3];
+  const bind=(unit,t)=>{gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,t)};
+  const upload=(t,src)=>{gl.bindTexture(gl.TEXTURE_2D,t);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,src)};
+  const quadDraw=()=>{gl.bindVertexArray(qva);gl.drawArrays(gl.TRIANGLE_STRIP,0,4)};
+  const common=(u)=>{gl.uniform2f(u.uSeed,seed[0],seed[1]);gl.uniform1f(u.uMaskA,maskA);gl.uniform1f(u.uAsp,w/h)};
+  const stream=canvas.captureStream(30);const track=stream.getVideoTracks()[0];try{track.contentHint='motion'}catch(e){}
+  FX.stream=stream;FX.track=track;
+  const api={w,h,canvas,hasMask:false,
+    uploadLive(v){upload(T.live,v)},
+    uploadMask(m,a){upload(T.mask,m);maskA=a;api.hasMask=true},
+    updateBg(rate){
+      const src=bgCur==='A'?T.bgA:T.bgB,dst=bgCur==='A'?F.bgB:F.bgA;
+      gl.disable(gl.BLEND);gl.viewport(0,0,bw,bh);gl.bindFramebuffer(gl.FRAMEBUFFER,dst);
+      gl.useProgram(P.bg.p);common(P.bg.u);bind(0,T.live);bind(1,T.mask);bind(2,src);
+      gl.uniform1i(P.bg.u.uLive,0);gl.uniform1i(P.bg.u.uMask,1);gl.uniform1i(P.bg.u.uPrev,2);gl.uniform1f(P.bg.u.uRate,rate);quadDraw();
+      bgCur=bgCur==='A'?'B':'A';
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    },
+    fillRoom(){
+      gl.disable(gl.BLEND);gl.viewport(0,0,fw,fh);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,F.src);gl.useProgram(P.src.p);common(P.src.u);
+      bind(0,T.live);bind(1,T.mask);bind(2,bgCur==='A'?T.bgA:T.bgB);
+      gl.uniform1i(P.src.u.uLive,0);gl.uniform1i(P.src.u.uMask,1);gl.uniform1i(P.src.u.uBg,2);gl.uniform2f(P.src.u.uTex,1/fw,1/fh);quadDraw();
+      gl.bindTexture(gl.TEXTURE_2D,T.src);gl.generateMipmap(gl.TEXTURE_2D);
+      gl.bindFramebuffer(gl.FRAMEBUFFER,F.fill);gl.useProgram(P.fill.p);bind(0,T.src);
+      gl.uniform1i(P.fill.u.uSrc,0);gl.uniform2f(P.fill.u.uTex,1/fw,1/fh);quadDraw();
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    },
+    snapshot(v){
+      upload(T.live,v);
+      gl.disable(gl.BLEND);gl.useProgram(P.copy.p);gl.uniform1i(P.copy.u.uSrc,0);
+      gl.viewport(0,0,w,h);gl.bindFramebuffer(gl.FRAMEBUFFER,F.snap);bind(0,T.live);quadDraw();
+      gl.viewport(0,0,256,256);gl.bindFramebuffer(gl.FRAMEBUFFER,F.snapMask);bind(0,T.mask);quadDraw();
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+    },
+    seed(s){seed=s},
+    render(mode,t){
+      api.fillRoom();
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,w,h);gl.disable(gl.BLEND);
+      gl.useProgram(P.comp.p);const u=P.comp.u;common(u);
+      bind(0,T.live);bind(1,T.mask);bind(2,T.fill);bind(3,T.snap);bind(4,T.snapMask);
+      gl.uniform1i(u.uLive,0);gl.uniform1i(u.uMask,1);gl.uniform1i(u.uFill,2);gl.uniform1i(u.uSnap,3);gl.uniform1i(u.uSnapMask,4);
+      gl.uniform1f(u.uT,t);gl.uniform1i(u.uMode,mode);gl.uniform1f(u.uSpread,mode===3?FX_BACK_SPREAD:FX_DUST_SPREAD);gl.uniform1f(u.uLead,FX_BACK_LEAD);
+      quadDraw();
+      if(mode===1||mode===3){
+        gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+        gl.useProgram(P.dust.p);const d=P.dust.u;common(d);
+        bind(0,T.snap);bind(1,T.snapMask);gl.uniform1i(d.uSnap,0);gl.uniform1i(d.uSnapMask,1);
+        gl.uniform1f(d.uT,t);gl.uniform1i(d.uMode,mode);gl.uniform1f(d.uAspect,w/h);gl.uniform1f(d.uPx,step*1.25);
+        gl.uniform1f(d.uSpread,mode===3?FX_BACK_SPREAD:FX_DUST_SPREAD);gl.uniform1f(d.uLead,FX_BACK_LEAD);
+        gl.bindVertexArray(gva);gl.drawArrays(gl.POINTS,0,cols*rows);
+        gl.disable(gl.BLEND);
+      }
+    },
+    destroy(){try{track.stop()}catch(e){}const ext=gl.getExtension('WEBGL_lose_context');if(ext)ext.loseContext()}
+  };
+  return api;
+}
+
+/* ---------- settings ---------- */
+function syncFxUi(){
+  const cb=$('fxToggle');if(cb)cb.checked=FX.on;
+  const b=$('fxTry');if(b)b.disabled=!FX.ready||!S.peer;
+}
+$('fxToggle').onchange=e=>{if(e.target.checked){ensureAudioCtx();fxEnable()}else fxDisable()};
+$('fxTry').onclick=()=>{closeDevices();setTimeout(()=>fxTrigger('button'),250)};
 
 /* ===================== CHAT ===================== */
 function addMsg(who,text,mine){
